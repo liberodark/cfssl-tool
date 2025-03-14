@@ -1,0 +1,48 @@
+# Certificate files
+*.crt
+*.cert
+*.cer
+*.pem
+*.der
+
+# Private keys
+*.key
+*.keystore
+
+# Certificate signing requests
+*.csr
+
+# Certificate revocation lists
+*.crl
+*.srl
+
+# PKCS#12 archives and Java keystores
+*.p12
+*.pfx
+*.jks
+
+# Temporary files created by the script
+*_temp.json
+request_temp.json
+cert_info_request.json
+cert_check_request.json
+
+# Backup files
+*.bak
+*.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].bak
+
+# Config files that might contain sensitive info
+.cfssl-tool.conf
+
+# Logs
+*.log
+
+# Temporary directories
+tmp/
+temp/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+.directory
+desktop.ini
