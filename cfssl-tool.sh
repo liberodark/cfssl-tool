@@ -5,7 +5,7 @@
 # Thanks :
 # License: GNU GPLv3
 
-version="1.0"
+version="1.1"
 
 echo "Welcome on CFSSL Tool Script $version"
 
@@ -24,7 +24,28 @@ DEFAULT_KEY_ALGO=${DEFAULT_KEY_ALGO:-ecdsa}
 DEFAULT_KEY_SIZE=${DEFAULT_KEY_SIZE:-256}
 
 CONFIG_FILE="$HOME/.cfssl-tool.conf"
-[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+for arg in "$@"; do
+  case $arg in
+    -F=*|--config-file=*)
+      CONFIG_FILE="${arg#*=}"
+      shift
+      ;;
+    -F|--config-file)
+      if [[ "$2" == -* ]] || [ -z "$2" ]; then
+        echo "Error: --config-file requires a path argument"
+        exit 1
+      fi
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
+  esac
+done
+
+[ -f "$CONFIG_FILE" ] && {
+  echo "Loading configuration from $CONFIG_FILE"
+  source "$CONFIG_FILE"
+}
 
 show_help() {
   echo "Usage: $0 [generate|revoke|check|info|renew-custom|check-revocation] [params]"
@@ -37,6 +58,9 @@ show_help() {
   echo "  check-revocation serial                     - Check if certificate is in CRL"
   echo "  info                                        - Show CA information"
   echo ""
+  echo "General options:"
+  echo "  -F, --config-file FILE     Use custom configuration file (default: $HOME/.cfssl-tool.conf)"
+  echo ""
   echo "Certificate generation options:"
   echo "  -c, --country CODE       Country code (default: $DEFAULT_COUNTRY)"
   echo "  -s, --state STATE        State/Province (default: $DEFAULT_STATE)"
@@ -47,13 +71,15 @@ show_help() {
   echo "  -b, --bits SIZE          Key size/bits (default: $DEFAULT_KEY_SIZE)"
   echo "  -d, --domains LIST       Additional domain names (comma-separated)"
   echo "  -n, --no-www             Don't add www subdomain automatically"
-  echo "  -f, --config FILE        Load certificate request from JSON file"
+  echo "  -f, --config-json FILE   Load certificate request from JSON file"
   echo "  -i, --interactive        Use interactive mode"
   echo ""
   echo "Examples:"
   echo "  $0 generate example.com server"
   echo "  $0 generate example.com server -c US -s California -l 'San Francisco' -o 'My Company'"
   echo "  $0 generate example.com server -d 'api.example.com,admin.example.com'"
+  echo "  $0 generate example.com server"
+  echo "  $0 -F /path/to/custom/config.conf generate example.com server"
   echo "  $0 revoke 567894780611517373554735158137087297011809058178 E9:0D:75:BA:FF:B9:74:39:0E:1F:8F:58:E5:F4:0B:36:4A:27:2A:E0 keyCompromise"
   echo "  $0 check example.com.crt"
   echo "  $0 check-revocation 566897563731316780990587952188820716605210348809"
@@ -337,7 +363,7 @@ parse_generate_options() {
       -b|--bits) KEY_SIZE="$2"; shift 2 ;;
       -d|--domains) ADDITIONAL_DOMAINS="$2"; shift 2 ;;
       -n|--no-www) ADD_WWW=false; shift ;;
-      -f|--config) CONFIG_JSON="$2"; shift 2 ;;
+      -f|--config-json) CONFIG_JSON="$2"; shift 2 ;;
       -i|--interactive) INTERACTIVE=true; shift ;;
       *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -363,6 +389,20 @@ parse_generate_options() {
 }
 
 [ -z "$ACTION" ] && show_help
+
+while [[ $# -gt 0 && "$1" == -* ]]; do
+  case $1 in
+    -F=*|--config-file=*)
+      shift
+      ;;
+    -F|--config-file)
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 case "$ACTION" in
   info)
