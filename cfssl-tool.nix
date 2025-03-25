@@ -5,9 +5,7 @@
 # Author: liberodark
 # License: GNU GPLv3
 
-version="1.2"
-
-echo "Welcome on CFSSL-OCSP Tool Script $version"
+version="1.3"
 
 #=================================================
 # RETRIEVE ARGUMENTS FROM THE MANIFEST AND VAR
@@ -25,6 +23,7 @@ DEFAULT_UNIT=${DEFAULT_UNIT:-IT}
 DEFAULT_KEY_ALGO=${DEFAULT_KEY_ALGO:-ecdsa}
 DEFAULT_KEY_SIZE=${DEFAULT_KEY_SIZE:-256}
 USE_OCSP=false
+RAW_OUTPUT=false
 
 CONFIG_FILE="$HOME/.cfssl-tool.conf"
 
@@ -42,13 +41,21 @@ for arg in "$@"; do
       CONFIG_FILE="$2"
       shift 2
       ;;
+    -R|--raw)
+      RAW_OUTPUT=true
+      shift
+      ;;
   esac
 done
 
 [ -f "$CONFIG_FILE" ] && {
-  echo "Loading configuration from $CONFIG_FILE"
+  #echo "Loading configuration from $CONFIG_FILE"
   source "$CONFIG_FILE"
 }
+
+if [ "$RAW_OUTPUT" = false ]; then
+  echo "Welcome on CFSSL-OCSP Tool Script $version"
+fi
 
 show_help() {
   echo "Usage: $0 [generate|revoke|check|info|renew-custom|check-revocation] [params]"
@@ -63,6 +70,7 @@ show_help() {
   echo ""
   echo "General options:"
   echo "  -F, --config-file FILE     Use custom configuration file (default: $HOME/.cfssl-tool.conf)"
+  echo "  -R, --raw                  Output only the raw JSON response from the server"
   echo ""
   echo "Certificate generation options:"
   echo "  -c, --country CODE       Country code (default: $DEFAULT_COUNTRY)"
@@ -95,8 +103,15 @@ show_help() {
 }
 
 get_ca_info() {
-  echo "Getting CA information..."
-  curl -s -X POST -H "Content-Type: application/json" -d '{}' $CFSSL_SERVER/api/v1/cfssl/info | jq
+  if [ "$RAW_OUTPUT" = false ]; then
+    echo "Getting CA information..."
+  fi
+  RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d '{}' $CFSSL_SERVER/api/v1/cfssl/info)
+  if [ "$RAW_OUTPUT" = true ]; then
+    echo "$RESPONSE"
+  else
+    echo "$RESPONSE" | jq
+  fi
 }
 
 ocsp_add_certificate() {
@@ -257,8 +272,16 @@ EOF
 }
 
 generate_certificate() {
-  echo "Generating certificate for $DOMAIN..."
+  if [ "$RAW_OUTPUT" = false ]; then
+    echo "Generating certificate for $DOMAIN..."
+  fi
   RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d @request_temp.json $CFSSL_SERVER/api/v1/cfssl/newcert)
+
+  if [ "$RAW_OUTPUT" = true ]; then
+    echo "$RESPONSE"
+    rm request_temp.json
+    return
+  fi
 
   echo "$RESPONSE" | jq -r .result.certificate > "${DOMAIN}".crt
   echo "$RESPONSE" | jq -r .result.private_key > "${DOMAIN}".key
@@ -319,8 +342,16 @@ revoke_certificate() {
   REASON=${3:-unspecified}
   REVOCATION_TIME=""
 
-  echo "Revoking certificate with serial $SERIAL..."
+  if [ "$RAW_OUTPUT" = false ]; then
+    echo "Revoking certificate with serial $SERIAL..."
+  fi
+
   RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"serial\": \"$SERIAL\", \"authority_key_id\": \"$AKI\", \"reason\": \"$REASON\"}" $CFSSL_SERVER/api/v1/cfssl/revoke)
+
+  if [ "$RAW_OUTPUT" = true ]; then
+    echo "$RESPONSE"
+    return
+  fi
 
   if echo "$RESPONSE" | grep -q "\"success\":true"; then
     echo "Certificate successfully revoked in CFSSL"
@@ -352,7 +383,9 @@ check_certificate() {
   CERT_ID=$1
 
   if [ -f "$CERT_ID" ]; then
-    echo "Checking certificate file $CERT_ID..."
+    if [ "$RAW_OUTPUT" = false ]; then
+      echo "Checking certificate file $CERT_ID..."
+    fi
     cat > cert_check_request.json << EOF
 {
   "certificate": "$(cat "$CERT_ID" | sed 's/$/\\n/' | tr -d '\n')"
@@ -361,8 +394,15 @@ EOF
     RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d @cert_check_request.json $CFSSL_SERVER/api/v1/cfssl/certinfo)
     rm cert_check_request.json
   else
-    echo "Checking certificate with serial $CERT_ID..."
+    if [ "$RAW_OUTPUT" = false ]; then
+      echo "Checking certificate with serial $CERT_ID..."
+    fi
     RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"serial\": \"$CERT_ID\"}" $CFSSL_SERVER/api/v1/cfssl/certinfo)
+  fi
+
+  if [ "$RAW_OUTPUT" = true ]; then
+    echo "$RESPONSE"
+    return
   fi
 
   if echo "$RESPONSE" | grep -q "result"; then
@@ -401,18 +441,23 @@ EOF
 check_revocation() {
   SERIAL_DEC=$1
 
-  if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
-    echo "Error: Python is required for converting decimal to hex."
-    exit 1
+  if [ "$RAW_OUTPUT" = false ]; then
+    if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
+      echo "Error: Python is required for converting decimal to hex."
+      exit 1
+    fi
+    PY_CMD=$(command -v python3 || command -v python)
+    SERIAL_HEX=$($PY_CMD -c "print(hex(int('$SERIAL_DEC'))[2:].upper())")
+    echo "Serial number (hex): $SERIAL_HEX"
+    echo "Retrieving CRL from $CFSSL_SERVER/api/v1/cfssl/crl..."
   fi
 
-  PY_CMD=$(command -v python3 || command -v python)
-
-  SERIAL_HEX=$($PY_CMD -c "print(hex(int('$SERIAL_DEC'))[2:].upper())")
-  echo "Serial number (hex): $SERIAL_HEX"
-
-  echo "Retrieving CRL from $CFSSL_SERVER/api/v1/cfssl/crl..."
   CRL_JSON=$(curl -s "$CFSSL_SERVER/api/v1/cfssl/crl")
+
+  if [ "$RAW_OUTPUT" = true ]; then
+    echo "$CRL_JSON"
+    return
+  fi
 
   SUCCESS=$(echo "$CRL_JSON" | jq -r '.success')
   if [ "$SUCCESS" != "true" ]; then
