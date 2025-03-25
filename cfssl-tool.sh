@@ -1,19 +1,20 @@
 #! /usr/bin/env bash
 #
-# About: CFSSL Tool
+# About: CFSSL Tool with OCSP API Support
 # Author: liberodark
-# Thanks :
 # License: GNU GPLv3
 
-version="1.1"
+version="1.2"
 
-echo "Welcome on CFSSL Tool Script $version"
+echo "Welcome on CFSSL-OCSP Tool Script $version"
 
 #=================================================
 # RETRIEVE ARGUMENTS FROM THE MANIFEST AND VAR
 #=================================================
 
 CFSSL_SERVER="http://192.168.0.185:8888"
+OCSP_SERVER="http://192.168.0.185:9000"
+OCSP_API_KEY="API_KEY"
 ACTION=$1
 DEFAULT_COUNTRY=${DEFAULT_COUNTRY:-FR}
 DEFAULT_STATE=${DEFAULT_STATE:-"Île-de-France"}
@@ -22,6 +23,7 @@ DEFAULT_ORGANIZATION=${DEFAULT_ORGANIZATION:-"My Organization"}
 DEFAULT_UNIT=${DEFAULT_UNIT:-IT}
 DEFAULT_KEY_ALGO=${DEFAULT_KEY_ALGO:-ecdsa}
 DEFAULT_KEY_SIZE=${DEFAULT_KEY_SIZE:-256}
+USE_OCSP=false
 
 CONFIG_FILE="$HOME/.cfssl-tool.conf"
 
@@ -74,15 +76,20 @@ show_help() {
   echo "  -f, --config-json FILE   Load certificate request from JSON file"
   echo "  -i, --interactive        Use interactive mode"
   echo ""
+  echo "OCSP Server options:"
+  echo "  -ocsp, --ocsp            Enable OCSP integration (disabled by default)"
+  echo "  --ocsp-server URL        OCSP API server URL (default: $OCSP_SERVER)"
+  echo "  --ocsp-key KEY           OCSP API key (default: from .cfssl-tool.conf)"
+  echo ""
   echo "Examples:"
   echo "  $0 generate example.com server"
   echo "  $0 generate example.com server -c US -s California -l 'San Francisco' -o 'My Company'"
   echo "  $0 generate example.com server -d 'api.example.com,admin.example.com'"
-  echo "  $0 generate example.com server"
+  echo "  $0 generate example.com server -ocsp"
   echo "  $0 -F /path/to/custom/config.conf generate example.com server"
-  echo "  $0 revoke 567894780611517373554735158137087297011809058178 E9:0D:75:BA:FF:B9:74:39:0E:1F:8F:58:E5:F4:0B:36:4A:27:2A:E0 keyCompromise"
-  echo "  $0 check example.com.crt"
-  echo "  $0 check-revocation 566897563731316780990587952188820716605210348809"
+  echo "  $0 revoke 567894780611517373554735158137087297011809058178 E9:0D:75:BA:FF:B9:74:39:0E:1F:8F:58:E5:F4:0B:36:4A:27:2A:E0 keyCompromise -ocsp"
+  echo "  $0 check example.com.crt -ocsp"
+  echo "  $0 check-revocation 566897563731316780990587952188820716605210348809 -ocsp"
   exit 1
 }
 
@@ -91,38 +98,120 @@ get_ca_info() {
   curl -s -X POST -H "Content-Type: application/json" -d '{}' $CFSSL_SERVER/api/v1/cfssl/info | jq
 }
 
+ocsp_add_certificate() {
+  local CERT_NUM=$1
+
+  if [ "$USE_OCSP" = false ]; then
+    return 0
+  fi
+
+  echo "Adding certificate $CERT_NUM to OCSP server..."
+  local RESPONSE
+  RESPONSE=$(curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: $OCSP_API_KEY" \
+    -d "{\"cert_num\": \"$CERT_NUM\"}" \
+    "$OCSP_SERVER"/api/certificates)
+
+  if echo "$RESPONSE" | grep -q "Certificate added successfully"; then
+    echo "Certificate successfully added to OCSP server"
+  else
+    echo "Error adding certificate to OCSP server:"
+    echo "$RESPONSE"
+  fi
+}
+
+ocsp_revoke_certificate() {
+  local CERT_NUM=$1
+  local REASON=$2
+  local REVOCATION_TIME=$3
+
+  if [ "$USE_OCSP" = false ]; then
+    return 0
+  fi
+
+  echo "Revoking certificate $CERT_NUM in OCSP server..."
+
+  local REQUEST_DATA
+  REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\"}"
+
+  if [ -n "$REVOCATION_TIME" ]; then
+    REQUEST_DATA=${REQUEST_DATA%\}}",\"revocation_time\":\"$REVOCATION_TIME\"}"
+  fi
+
+  local RESPONSE
+  RESPONSE=$(curl -s -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: $OCSP_API_KEY" \
+    -d "$REQUEST_DATA" \
+    "$OCSP_SERVER"/api/certificates/revoke)
+
+  if echo "$RESPONSE" | grep -q "Certificate revoked successfully"; then
+    echo "Certificate successfully revoked in OCSP server"
+  else
+    echo "Error revoking certificate in OCSP server:"
+    echo "$RESPONSE"
+  fi
+}
+
+ocsp_check_certificate() {
+  local CERT_NUM=$1
+
+  if [ "$USE_OCSP" = false ]; then
+    return 0
+  fi
+
+  echo "Checking certificate $CERT_NUM in OCSP server..."
+  local RESPONSE
+  RESPONSE=$(curl -s -X GET \
+    -H "X-API-Key: $OCSP_API_KEY" \
+    "$OCSP_SERVER"/api/certificates/"$CERT_NUM")
+
+  if echo "$RESPONSE" | grep -q "Certificate status retrieved"; then
+    echo "==== OCSP Status ===="
+    echo "Status: $(echo "$RESPONSE" | jq -r '.status')"
+    echo "Message: $(echo "$RESPONSE" | jq -r '.message')"
+  else
+    echo "Error checking certificate in OCSP server:"
+    echo "$RESPONSE"
+  fi
+}
+
 generate_interactive() {
   echo "==== Interactive Certificate Generation ===="
 
-  read -r "Domain name: " DOMAIN
-  read -r "Profile [server]: " PROFILE
+  read -r -p "Domain name: " DOMAIN
+  read -r -p "Profile [server]: " PROFILE
   PROFILE=${PROFILE:-server}
 
-  read -r "Country code [$DEFAULT_COUNTRY]: " COUNTRY
+  read -r -p "Country code [$DEFAULT_COUNTRY]: " COUNTRY
   COUNTRY=${COUNTRY:-$DEFAULT_COUNTRY}
 
-  read -r "State/Province [$DEFAULT_STATE]: " STATE
+  read -r -p "State/Province [$DEFAULT_STATE]: " STATE
   STATE=${STATE:-$DEFAULT_STATE}
 
-  read -r "City [$DEFAULT_CITY]: " CITY
+  read -r -p "City [$DEFAULT_CITY]: " CITY
   CITY=${CITY:-$DEFAULT_CITY}
 
-  read -r "Organization [$DEFAULT_ORGANIZATION]: " ORGANIZATION
+  read -r -p "Organization [$DEFAULT_ORGANIZATION]: " ORGANIZATION
   ORGANIZATION=${ORGANIZATION:-$DEFAULT_ORGANIZATION}
 
-  read -r "Organizational Unit [$DEFAULT_UNIT]: " UNIT
+  read -r -p "Organizational Unit [$DEFAULT_UNIT]: " UNIT
   UNIT=${UNIT:-$DEFAULT_UNIT}
 
-  read -r "Key algorithm [$DEFAULT_KEY_ALGO]: " KEY_ALGO
+  read -r -p "Key algorithm [$DEFAULT_KEY_ALGO]: " KEY_ALGO
   KEY_ALGO=${KEY_ALGO:-$DEFAULT_KEY_ALGO}
 
-  read -r "Key size [$DEFAULT_KEY_SIZE]: " KEY_SIZE
+  read -r -p "Key size [$DEFAULT_KEY_SIZE]: " KEY_SIZE
   KEY_SIZE=${KEY_SIZE:-$DEFAULT_KEY_SIZE}
 
-  read -r "Additional domains (comma-separated): " ADDITIONAL_DOMAINS
+  read -r -p "Additional domains (comma-separated): " ADDITIONAL_DOMAINS
 
-  read -r "Add www subdomain? [Y/n]: " WWW_CHOICE
+  read -r -p "Add www subdomain? [Y/n]: " WWW_CHOICE
   [[ "$WWW_CHOICE" == [Nn]* ]] && ADD_WWW=false || ADD_WWW=true
+
+  read -r -p "Use OCSP integration? [y/N]: " OCSP_CHOICE
+  [[ "$OCSP_CHOICE" == [Yy]* ]] && USE_OCSP=true || USE_OCSP=false
 
   create_cert_request
   generate_certificate
@@ -208,6 +297,11 @@ EOF
     echo "Valid until: $VALIDITY"
     echo "Save this information for future revocation/renewal"
 
+    if [ "$USE_OCSP" = true ] && [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
+      SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+      ocsp_add_certificate "$SERIAL_HEX"
+    fi
+
     rm cert_info_request.json
   else
     echo "Error generating certificate"
@@ -222,12 +316,31 @@ revoke_certificate() {
   SERIAL=$1
   AKI=$2
   REASON=${3:-unspecified}
+  REVOCATION_TIME=""
 
   echo "Revoking certificate with serial $SERIAL..."
   RESPONSE=$(curl -s -X POST -H "Content-Type: application/json" -d "{\"serial\": \"$SERIAL\", \"authority_key_id\": \"$AKI\", \"reason\": \"$REASON\"}" $CFSSL_SERVER/api/v1/cfssl/revoke)
 
   if echo "$RESPONSE" | grep -q "\"success\":true"; then
-    echo "Certificate successfully revoked"
+    echo "Certificate successfully revoked in CFSSL"
+
+    REVOCATION_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    if [ "$USE_OCSP" = true ]; then
+      case "$REASON" in
+        keyCompromise) OCSP_REASON="key_compromise" ;;
+        CACompromise) OCSP_REASON="ca_compromise" ;;
+        affiliationChanged) OCSP_REASON="affiliation_changed" ;;
+        superseded) OCSP_REASON="superseded" ;;
+        cessationOfOperation) OCSP_REASON="cessation_of_operation" ;;
+        certificateHold) OCSP_REASON="certificate_hold" ;;
+        removeFromCRL) OCSP_REASON="unspecified" ;;
+        *) OCSP_REASON="unspecified" ;;
+      esac
+
+      SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+      ocsp_revoke_certificate "$SERIAL_HEX" "$OCSP_REASON" "$REVOCATION_TIME"
+    fi
   else
     echo "Error revoking certificate:"
     echo "$RESPONSE"
@@ -269,6 +382,14 @@ EOF
       echo "Reason: $REASON"
     else
       echo "Status: VALID"
+    fi
+
+    if [ "$USE_OCSP" = true ]; then
+      SERIAL=$(echo "$RESPONSE" | jq -r '.result.serial_number')
+      if [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
+        SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+        ocsp_check_certificate "$SERIAL_HEX"
+      fi
     fi
   else
     echo "Error checking certificate:"
@@ -332,6 +453,11 @@ check_revocation() {
     echo "Certificate with serial number $SERIAL_HEX is NOT found in the CRL."
   fi
 
+  if [ "$USE_OCSP" = true ]; then
+    OCSP_SERIAL_HEX="0x$(echo "$SERIAL_HEX" | tr '[:upper:]' '[:lower:]')"
+    ocsp_check_certificate "$OCSP_SERIAL_HEX"
+  fi
+
   rm -rf "$TEMP_DIR"
 }
 
@@ -365,6 +491,10 @@ parse_generate_options() {
       -n|--no-www) ADD_WWW=false; shift ;;
       -f|--config-json) CONFIG_JSON="$2"; shift 2 ;;
       -i|--interactive) INTERACTIVE=true; shift ;;
+      -ocsp|--ocsp) USE_OCSP=true; shift ;;
+      --ocsp-server) OCSP_SERVER="$2"; shift 2 ;;
+      --ocsp-key) OCSP_API_KEY="$2"; shift 2 ;;
+      --no-ocsp) USE_OCSP=false; shift ;;
       *) echo "Unknown option: $1"; exit 1 ;;
     esac
   done
@@ -398,11 +528,29 @@ while [[ $# -gt 0 && "$1" == -* ]]; do
     -F|--config-file)
       shift 2
       ;;
+    -ocsp|--ocsp)
+      USE_OCSP=true
+      shift
+      ;;
+    --ocsp-server=*)
+      OCSP_SERVER="${1#*=}"
+      shift
+      ;;
+    --ocsp-key=*)
+      OCSP_API_KEY="${1#*=}"
+      shift
+      ;;
+    --no-ocsp)
+      USE_OCSP=false
+      shift
+      ;;
     *)
       break
       ;;
   esac
 done
+
+ACTION=$1
 
 case "$ACTION" in
   info)
@@ -431,7 +579,7 @@ case "$ACTION" in
   revoke)
     [ -z "$2" ] || [ -z "$3" ] && {
       echo "Error: Serial number and Authority Key ID required"
-      echo "Usage: $0 revoke serial aki [reason]"
+      echo "Usage: $0 revoke serial aki [reason] [-ocsp]"
       echo "Valid reasons: unspecified, keyCompromise, CACompromise, affiliationChanged,"
       echo "               superseded, cessationOfOperation, certificateHold, removeFromCRL"
       exit 1
@@ -442,7 +590,7 @@ case "$ACTION" in
   check)
     [ -z "$2" ] && {
       echo "Error: Certificate file or serial number required"
-      echo "Usage: $0 check certificate.crt | serial"
+      echo "Usage: $0 check certificate.crt | serial [-ocsp]"
       exit 1
     }
     check_certificate "$2"
@@ -451,7 +599,7 @@ case "$ACTION" in
   check-revocation)
     [ -z "$2" ] && {
       echo "Error: Serial number required"
-      echo "Usage: $0 check-revocation serial_number"
+      echo "Usage: $0 check-revocation serial_number [-ocsp]"
       exit 1
     }
     check_revocation "$2"
