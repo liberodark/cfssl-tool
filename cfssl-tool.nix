@@ -5,7 +5,7 @@
 # Author: liberodark
 # License: GNU GPLv3
 
-version="1.3"
+version="1.4"
 
 #=================================================
 # RETRIEVE ARGUMENTS FROM THE MANIFEST AND VAR
@@ -121,7 +121,10 @@ ocsp_add_certificate() {
     return 0
   fi
 
-  echo "Adding certificate $CERT_NUM to OCSP server..."
+  if [ "$RAW_OUTPUT" = false ]; then
+    echo "Adding certificate $CERT_NUM to OCSP server..."
+  fi
+
   local RESPONSE
   RESPONSE=$(curl -s -X POST \
     -H "Content-Type: application/json" \
@@ -129,11 +132,13 @@ ocsp_add_certificate() {
     -d "{\"cert_num\": \"$CERT_NUM\"}" \
     "$OCSP_SERVER"/api/certificates)
 
-  if echo "$RESPONSE" | grep -q "Certificate added successfully"; then
-    echo "Certificate successfully added to OCSP server"
-  else
-    echo "Error adding certificate to OCSP server:"
-    echo "$RESPONSE"
+  if [ "$RAW_OUTPUT" = false ]; then
+    if echo "$RESPONSE" | grep -q "Certificate added successfully"; then
+      echo "Certificate successfully added to OCSP server"
+    else
+      echo "Error adding certificate to OCSP server:"
+      echo "$RESPONSE"
+    fi
   fi
 }
 
@@ -146,7 +151,9 @@ ocsp_revoke_certificate() {
     return 0
   fi
 
-  echo "Revoking certificate $CERT_NUM in OCSP server..."
+  if [ "$RAW_OUTPUT" = false ]; then
+    echo "Revoking certificate $CERT_NUM in OCSP server..."
+  fi
 
   local REQUEST_DATA
   REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\"}"
@@ -162,11 +169,13 @@ ocsp_revoke_certificate() {
     -d "$REQUEST_DATA" \
     "$OCSP_SERVER"/api/certificates/revoke)
 
-  if echo "$RESPONSE" | grep -q "Certificate revoked successfully"; then
-    echo "Certificate successfully revoked in OCSP server"
-  else
-    echo "Error revoking certificate in OCSP server:"
-    echo "$RESPONSE"
+  if [ "$RAW_OUTPUT" = false ]; then
+    if echo "$RESPONSE" | grep -q "Certificate revoked successfully"; then
+      echo "Certificate successfully revoked in OCSP server"
+    else
+      echo "Error revoking certificate in OCSP server:"
+      echo "$RESPONSE"
+    fi
   fi
 }
 
@@ -177,19 +186,24 @@ ocsp_check_certificate() {
     return 0
   fi
 
-  echo "Checking certificate $CERT_NUM in OCSP server..."
+  if [ "$RAW_OUTPUT" = false ]; then
+    echo "Checking certificate $CERT_NUM in OCSP server..."
+  fi
+
   local RESPONSE
   RESPONSE=$(curl -s -X GET \
     -H "X-API-Key: $OCSP_API_KEY" \
     "$OCSP_SERVER"/api/certificates/"$CERT_NUM")
 
-  if echo "$RESPONSE" | grep -q "Certificate status retrieved"; then
-    echo "==== OCSP Status ===="
-    echo "Status: $(echo "$RESPONSE" | jq -r '.status')"
-    echo "Message: $(echo "$RESPONSE" | jq -r '.message')"
-  else
-    echo "Error checking certificate in OCSP server:"
-    echo "$RESPONSE"
+  if [ "$RAW_OUTPUT" = false ]; then
+    if echo "$RESPONSE" | grep -q "Certificate status retrieved"; then
+      echo "==== OCSP Status ===="
+      echo "Status: $(echo "$RESPONSE" | jq -r '.status')"
+      echo "Message: $(echo "$RESPONSE" | jq -r '.message')"
+    else
+      echo "Error checking certificate in OCSP server:"
+      echo "$RESPONSE"
+    fi
   fi
 }
 
@@ -279,7 +293,33 @@ generate_certificate() {
 
   if [ "$RAW_OUTPUT" = true ]; then
     echo "$RESPONSE"
-    rm request_temp.json
+
+    if [ "$USE_OCSP" = true ] && echo "$RESPONSE" | jq -e '.result.certificate' > /dev/null 2>&1; then
+      TEMP_DIR=$(mktemp -d)
+      TEMP_CRT="$TEMP_DIR/${DOMAIN}.crt"
+
+      echo "$RESPONSE" | jq -r '.result.certificate' > "$TEMP_CRT" 2>/dev/null
+
+      if [ -s "$TEMP_CRT" ]; then
+        cat > "$TEMP_DIR/cert_info_request.json" << EOF
+{
+  "certificate": "$(cat "$TEMP_CRT" | sed 's/$/\\n/' | tr -d '\n')"
+}
+EOF
+
+        CERT_INFO=$(curl -s -X POST -H "Content-Type: application/json" -d @"$TEMP_DIR/cert_info_request.json" $CFSSL_SERVER/api/v1/cfssl/certinfo)
+        SERIAL=$(echo "$CERT_INFO" | jq -r '.result.serial_number')
+
+        if [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
+          SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+          ocsp_add_certificate "$SERIAL_HEX"
+        fi
+      fi
+
+      rm -rf "$TEMP_DIR"
+    fi
+
+    rm -f request_temp.json
     return
   fi
 
@@ -326,14 +366,14 @@ EOF
       ocsp_add_certificate "$SERIAL_HEX"
     fi
 
-    rm cert_info_request.json
+    rm -f cert_info_request.json
   else
     echo "Error generating certificate"
     echo "Server response:"
     echo "$RESPONSE"
   fi
 
-  rm request_temp.json
+  rm -f request_temp.json
 }
 
 revoke_certificate() {
