@@ -4,7 +4,7 @@
 # Author: liberodark
 # License: GNU GPLv3
 
-version="1.4"
+version="1.5"
 
 #=================================================
 # RETRIEVE ARGUMENTS FROM THE MANIFEST AND VAR
@@ -144,7 +144,7 @@ ocsp_add_certificate() {
 ocsp_revoke_certificate() {
   local CERT_NUM=$1
   local REASON=$2
-  local REVOCATION_TIME=$3
+  # local REVOCATION_TIME=$3
 
   if [ "$USE_OCSP" = false ]; then
     return 0
@@ -154,12 +154,11 @@ ocsp_revoke_certificate() {
     echo "Revoking certificate $CERT_NUM in OCSP server..."
   fi
 
-  local REQUEST_DATA
-  REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\"}"
+  local REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\"}"
 
-  if [ -n "$REVOCATION_TIME" ]; then
-    REQUEST_DATA=${REQUEST_DATA%\}}",\"revocation_time\":\"$REVOCATION_TIME\"}"
-  fi
+  # if [ -n "$REVOCATION_TIME" ]; then
+  #   REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\", \"revocation_time\": \"$REVOCATION_TIME\"}"
+  # fi
 
   local RESPONSE
   RESPONSE=$(curl -s -X POST \
@@ -453,7 +452,9 @@ EOF
     echo "Not After: $(echo "$RESPONSE" | jq -r '.result.not_after')"
     echo "AKI: $(echo "$RESPONSE" | jq -r '.result.authority_key_id')"
 
+    SERIAL=$(echo "$RESPONSE" | jq -r '.result.serial_number')
     REVOKED=$(echo "$RESPONSE" | jq -r '.result.revoked')
+
     if [ "$REVOKED" == "true" ]; then
       REVOCATION_TIME=$(echo "$RESPONSE" | jq -r '.result.revocation_time')
       REASON=$(echo "$RESPONSE" | jq -r '.result.revocation_reason')
@@ -461,11 +462,43 @@ EOF
       echo "Revocation time: $REVOCATION_TIME"
       echo "Reason: $REASON"
     else
-      echo "Status: VALID"
+      if [ -n "$SERIAL" ] && [ "$SERIAL" != "null" ]; then
+        if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
+          echo "Python is required for CRL verification"
+          echo "Status: UNKNOWN (cannot verify CRL)"
+        else
+          PY_CMD=$(command -v python3 || command -v python)
+          SERIAL_HEX=$($PY_CMD -c "print(hex(int('$SERIAL'))[2:].upper())")
+
+          CRL_JSON=$(curl -s "$CFSSL_SERVER/api/v1/cfssl/crl")
+          SUCCESS=$(echo "$CRL_JSON" | jq -r '.success')
+
+          if [ "$SUCCESS" == "true" ]; then
+            TEMP_DIR=$(mktemp -d)
+            CRL_BASE64_FILE="$TEMP_DIR/crl_base64.txt"
+            CRL_DER_FILE="$TEMP_DIR/crl.der"
+
+            echo "$(echo "$CRL_JSON" | jq -r '.result')" > "$CRL_BASE64_FILE"
+            base64 -d "$CRL_BASE64_FILE" > "$CRL_DER_FILE"
+
+            CRL_CONTENT=$(openssl crl -inform DER -text -noout -in "$CRL_DER_FILE" 2>/dev/null)
+            if echo "$CRL_CONTENT" | grep -iq "$SERIAL_HEX"; then
+              echo "Status: REVOKED (listed in CRL)"
+            else
+              echo "Status: VALID"
+            fi
+
+            rm -rf "$TEMP_DIR"
+          else
+            echo "Status: VALID (could not verify CRL)"
+          fi
+        fi
+      else
+        echo "Status: VALID"
+      fi
     fi
 
     if [ "$USE_OCSP" = true ]; then
-      SERIAL=$(echo "$RESPONSE" | jq -r '.result.serial_number')
       if [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
         SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
         ocsp_check_certificate "$SERIAL_HEX"
