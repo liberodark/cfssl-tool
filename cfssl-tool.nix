@@ -5,7 +5,7 @@
 # Author: liberodark
 # License: GNU GPLv3
 
-version="1.5"
+version="1.6"
 
 #=================================================
 # RETRIEVE ARGUMENTS FROM THE MANIFEST AND VAR
@@ -14,7 +14,6 @@ version="1.5"
 CFSSL_SERVER="http://192.168.0.185:8888"
 OCSP_SERVER="http://192.168.0.185:9000"
 OCSP_API_KEY="API_KEY"
-ACTION=$1
 DEFAULT_COUNTRY=${DEFAULT_COUNTRY:-FR}
 DEFAULT_STATE=${DEFAULT_STATE:-"Île-de-France"}
 DEFAULT_CITY=${DEFAULT_CITY:-Paris}
@@ -56,6 +55,49 @@ done
 if [ "$RAW_OUTPUT" = false ]; then
   echo "Welcome on CFSSL-OCSP Tool Script $version"
 fi
+
+process_global_options() {
+  local args=("$@")
+  local i=0
+  local new_args=()
+
+  while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+      -ocsp|--ocsp)
+        USE_OCSP=true
+        ;;
+      --ocsp-server=*)
+        OCSP_SERVER="${args[$i]#*=}"
+        ;;
+      --ocsp-key=*)
+        OCSP_API_KEY="${args[$i]#*=}"
+        ;;
+      --no-ocsp)
+        USE_OCSP=false
+        ;;
+      --ocsp-server)
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+          OCSP_SERVER="${args[$i+1]}"
+          i=$((i+1))
+        fi
+        ;;
+      --ocsp-key)
+        if [ $((i+1)) -lt ${#args[@]} ]; then
+          OCSP_API_KEY="${args[$i+1]}"
+          i=$((i+1))
+        fi
+        ;;
+      *)
+        new_args+=("${args[$i]}")
+        ;;
+    esac
+    i=$((i+1))
+  done
+
+  for arg in "${new_args[@]}"; do
+    echo "$arg"
+  done
+}
 
 show_help() {
   echo "Usage: $0 [generate|revoke|check|info|renew-custom|check-revocation] [params]"
@@ -145,7 +187,6 @@ ocsp_add_certificate() {
 ocsp_revoke_certificate() {
   local CERT_NUM=$1
   local REASON=$2
-  # local REVOCATION_TIME=$3
 
   if [ "$USE_OCSP" = false ]; then
     return 0
@@ -156,10 +197,6 @@ ocsp_revoke_certificate() {
   fi
 
   local REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\"}"
-
-  # if [ -n "$REVOCATION_TIME" ]; then
-  #   REQUEST_DATA="{\"cert_num\": \"$CERT_NUM\", \"reason\": \"$REASON\", \"revocation_time\": \"$REVOCATION_TIME\"}"
-  # fi
 
   local RESPONSE
   RESPONSE=$(curl -s -X POST \
@@ -310,7 +347,7 @@ EOF
         SERIAL=$(echo "$CERT_INFO" | jq -r '.result.serial_number')
 
         if [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
-          SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+          SERIAL_HEX=$(convert_serial "$SERIAL" "0xhex")
           ocsp_add_certificate "$SERIAL_HEX"
         fi
       fi
@@ -361,7 +398,7 @@ EOF
     echo "Save this information for future revocation/renewal"
 
     if [ "$USE_OCSP" = true ] && [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
-      SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+      SERIAL_HEX=$(convert_serial "$SERIAL" "0xhex")
       ocsp_add_certificate "$SERIAL_HEX"
     fi
 
@@ -379,7 +416,14 @@ revoke_certificate() {
   SERIAL=$1
   AKI=$2
   REASON=${3:-unspecified}
-  REVOCATION_TIME=""
+
+  if [[ "$AKI" == *:* ]]; then
+    AKI_PLAIN=$(echo "$AKI" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+    if [ "$RAW_OUTPUT" = false ]; then
+      echo "Converting AKI from '$AKI' to plain format '$AKI_PLAIN'"
+    fi
+    AKI="$AKI_PLAIN"
+  fi
 
   if [ "$RAW_OUTPUT" = false ]; then
     echo "Revoking certificate with serial $SERIAL..."
@@ -395,8 +439,6 @@ revoke_certificate() {
   if echo "$RESPONSE" | grep -q "\"success\":true"; then
     echo "Certificate successfully revoked in CFSSL"
 
-    REVOCATION_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
     if [ "$USE_OCSP" = true ]; then
       case "$REASON" in
         keyCompromise) OCSP_REASON="key_compromise" ;;
@@ -409,8 +451,8 @@ revoke_certificate() {
         *) OCSP_REASON="unspecified" ;;
       esac
 
-      SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
-      ocsp_revoke_certificate "$SERIAL_HEX" "$OCSP_REASON" "$REVOCATION_TIME"
+      SERIAL_HEX=$(convert_serial "$SERIAL" "0xhex")
+      ocsp_revoke_certificate "$SERIAL_HEX" "$OCSP_REASON"
     fi
   else
     echo "Error revoking certificate:"
@@ -469,7 +511,7 @@ EOF
           echo "Status: UNKNOWN (cannot verify CRL)"
         else
           PY_CMD=$(command -v python3 || command -v python)
-          SERIAL_HEX=$($PY_CMD -c "print(hex(int('$SERIAL'))[2:].upper())")
+          SERIAL_HEX=$(convert_serial "$SERIAL" "HEX")
 
           CRL_JSON=$(curl -s "$CFSSL_SERVER/api/v1/cfssl/crl")
           SUCCESS=$(echo "$CRL_JSON" | jq -r '.success')
@@ -479,7 +521,7 @@ EOF
             CRL_BASE64_FILE="$TEMP_DIR/crl_base64.txt"
             CRL_DER_FILE="$TEMP_DIR/crl.der"
 
-            echo "$(echo "$CRL_JSON" | jq -r '.result')" > "$CRL_BASE64_FILE"
+            echo "$CRL_JSON" | jq -r '.result' > "$CRL_BASE64_FILE"
             base64 -d "$CRL_BASE64_FILE" > "$CRL_DER_FILE"
 
             CRL_CONTENT=$(openssl crl -inform DER -text -noout -in "$CRL_DER_FILE" 2>/dev/null)
@@ -501,7 +543,7 @@ EOF
 
     if [ "$USE_OCSP" = true ]; then
       if [ "$SERIAL" != "null" ] && [ -n "$SERIAL" ]; then
-        SERIAL_HEX="0x$(python3 -c "print(hex(int('$SERIAL'))[2:].lower())")"
+        SERIAL_HEX=$(convert_serial "$SERIAL" "0xhex")
         ocsp_check_certificate "$SERIAL_HEX"
       fi
     fi
@@ -520,7 +562,7 @@ check_revocation() {
       exit 1
     fi
     PY_CMD=$(command -v python3 || command -v python)
-    SERIAL_HEX=$($PY_CMD -c "print(hex(int('$SERIAL_DEC'))[2:].upper())")
+    SERIAL_HEX=$(convert_serial "$SERIAL_DEC" "HEX")
     echo "Serial number (hex): $SERIAL_HEX"
     echo "Retrieving CRL from $CFSSL_SERVER/api/v1/cfssl/crl..."
   fi
@@ -573,11 +615,46 @@ check_revocation() {
   fi
 
   if [ "$USE_OCSP" = true ]; then
-    OCSP_SERIAL_HEX="0x$(echo "$SERIAL_HEX" | tr '[:upper:]' '[:lower:]')"
+    OCSP_SERIAL_HEX=$(convert_serial "$SERIAL_HEX" "0xhex")
     ocsp_check_certificate "$OCSP_SERIAL_HEX"
   fi
 
   rm -rf "$TEMP_DIR"
+}
+
+convert_serial() {
+  local SERIAL=$1
+  local FORMAT=$2
+
+  if [[ $SERIAL =~ ^[0-9]+$ ]]; then
+    # The number is in decimal
+    case $FORMAT in
+      "hex") python3 -c "print(hex(int('$SERIAL'))[2:].lower())" ;;
+      "HEX") python3 -c "print(hex(int('$SERIAL'))[2:].upper())" ;;
+      "0xhex") python3 -c "print('0x' + hex(int('$SERIAL'))[2:].lower())" ;;
+      "dec") echo "$SERIAL" ;;
+      *) echo "$SERIAL" ;;
+    esac
+  elif [[ $SERIAL =~ ^0x ]]; then
+    # The number is in hex with 0x prefix
+    SERIAL=${SERIAL#0x}
+    case $FORMAT in
+      "hex") echo "$SERIAL" | tr 'A-F' 'a-f' ;;
+      "HEX") echo "$SERIAL" | tr 'a-f' 'A-F' ;;
+      "0xhex") echo "0x$SERIAL" | tr 'A-F' 'a-f' ;;
+      "dec") python3 -c "print(int('$SERIAL', 16))" ;;
+      *) echo "$SERIAL" ;;
+    esac
+  else
+    # The number is in hex without a prefix
+    case $FORMAT in
+      "hex") echo "$SERIAL" | tr 'A-F' 'a-f' ;;
+      "HEX") echo "$SERIAL" | tr 'a-f' 'A-F' ;;
+      "0xhex") echo "0x$SERIAL" | tr 'A-F' 'a-f' ;;
+      "dec") python3 -c "print(int('$SERIAL', 16))" ;;
+      *) echo "$SERIAL" ;;
+    esac
+  fi
 }
 
 parse_generate_options() {
@@ -637,39 +714,32 @@ parse_generate_options() {
   fi
 }
 
-[ -z "$ACTION" ] && show_help
+[ -z "$1" ] && show_help
 
-while [[ $# -gt 0 && "$1" == -* ]]; do
-  case $1 in
-    -F=*|--config-file=*)
-      shift
-      ;;
-    -F|--config-file)
-      shift 2
-      ;;
+for arg in "$@"; do
+  case $arg in
     -ocsp|--ocsp)
       USE_OCSP=true
-      shift
       ;;
     --ocsp-server=*)
-      OCSP_SERVER="${1#*=}"
-      shift
+      OCSP_SERVER="${arg#*=}"
       ;;
     --ocsp-key=*)
-      OCSP_API_KEY="${1#*=}"
-      shift
+      OCSP_API_KEY="${arg#*=}"
       ;;
     --no-ocsp)
       USE_OCSP=false
-      shift
       ;;
-    *)
-      break
+    --ocsp-server)
+      ;;
+    --ocsp-key)
       ;;
   esac
 done
 
 ACTION=$1
+
+[ -z "$ACTION" ] && show_help
 
 case "$ACTION" in
   info)
@@ -677,50 +747,68 @@ case "$ACTION" in
     ;;
 
   generate)
-    [ -z "$2" ] && { echo "Error: Domain name required"; exit 1; }
-    parse_generate_options "$2" "$3" "${@:4}"
+    if [ -z "$2" ]; then
+      echo "Error: Domain name required"
+      exit 1
+    fi
+    DOMAIN=$2
+    PROFILE=${3:-server}
+    parse_generate_options "$DOMAIN" "$PROFILE" "${@:4}"
     generate_certificate
     ;;
 
   renew-custom)
-    [ -z "$2" ] && { echo "Error: Domain name required"; exit 1; }
+    if [ -z "$2" ]; then
+      echo "Error: Domain name required"
+      exit 1
+    fi
     DOMAIN=$2
+    PROFILE=${3:-server}
+
     [ -f "${DOMAIN}.crt" ] && {
       echo "Backing up existing certificate and key..."
       timestamp=$(date +%Y%m%d%H%M%S)
       cp "${DOMAIN}.crt" "${DOMAIN}.crt.${timestamp}.bak"
       cp "${DOMAIN}.key" "${DOMAIN}.key.${timestamp}.bak"
     }
-    parse_generate_options "$2" "$3" "${@:4}"
+
+    parse_generate_options "$DOMAIN" "$PROFILE" "${@:4}"
     generate_certificate
     ;;
 
   revoke)
-    [ -z "$2" ] || [ -z "$3" ] && {
+    if [ -z "$2" ] || [ -z "$3" ]; then
       echo "Error: Serial number and Authority Key ID required"
       echo "Usage: $0 revoke serial aki [reason] [-ocsp]"
       echo "Valid reasons: unspecified, keyCompromise, CACompromise, affiliationChanged,"
       echo "               superseded, cessationOfOperation, certificateHold, removeFromCRL"
       exit 1
-    }
-    revoke_certificate "$2" "$3" "$4"
+    fi
+    REASON=""
+    for arg in "${@:4}"; do
+      if [[ ! "$arg" == -* ]]; then
+        REASON="$arg"
+        break
+      fi
+    done
+    revoke_certificate "$2" "$3" "$REASON"
     ;;
 
   check)
-    [ -z "$2" ] && {
+    if [ -z "$2" ]; then
       echo "Error: Certificate file or serial number required"
       echo "Usage: $0 check certificate.crt | serial [-ocsp]"
       exit 1
-    }
+    fi
     check_certificate "$2"
     ;;
 
   check-revocation)
-    [ -z "$2" ] && {
+    if [ -z "$2" ]; then
       echo "Error: Serial number required"
       echo "Usage: $0 check-revocation serial_number [-ocsp]"
       exit 1
-    }
+    fi
     check_revocation "$2"
     ;;
 
